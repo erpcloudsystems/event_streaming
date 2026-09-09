@@ -27,6 +27,12 @@ def notify_consumers(doc, event):
 	if frappe.flags.in_install or frappe.flags.in_migrate:
 		return
 
+	if doc.flags.get("via_event_streaming_sync"):
+		# this write was applied by event_streaming itself while syncing an
+		# incoming update; do not re-broadcast it or it will bounce back
+		# and forth between producer and consumer forever
+		return
+
 	consumers = check_doctype_has_consumers(doc.doctype)
 	if consumers:
 		if event == "after_insert":

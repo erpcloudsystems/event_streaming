@@ -309,6 +309,8 @@ def set_insert(update, producer_site, event_producer):
 	else:
 		sync_dependencies(doc, producer_site)
 
+	doc.flags.via_event_streaming_sync = True
+
 	if update.use_same_name:
 		doc.insert(set_name=update.docname, set_child_names=False)
 	else:
@@ -342,6 +344,7 @@ def set_update(update, producer_site):
 		else:
 			sync_dependencies(local_doc, producer_site)
 
+		local_doc.flags.via_event_streaming_sync = True
 		local_doc.save()
 		local_doc.db_update_all()
 
@@ -390,6 +393,7 @@ def set_delete(update):
 	"""Sync delete type update"""
 	local_doc = get_local_doc(update)
 	if local_doc:
+		local_doc.flags.via_event_streaming_sync = True
 		local_doc.delete()
 
 
