@@ -101,7 +101,12 @@ def register_consumer(data):
 	for entry in consumer_doctypes:
 		consumer.append(
 			"consumer_doctypes",
-			{"ref_doctype": entry.get("doctype"), "status": "Pending", "condition": entry.get("condition")},
+			{
+				"ref_doctype": entry.get("doctype"),
+				"status": "Pending",
+				"condition": entry.get("condition"),
+				"sync_on": entry.get("sync_on") or "After Insert",
+			},
 		)
 
 	consumer.insert()

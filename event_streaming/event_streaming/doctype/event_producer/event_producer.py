@@ -120,7 +120,9 @@ class EventProducer(Document):
 				dt = frappe.db.get_value("Document Type Mapping", entry.mapping, "remote_doctype")
 			else:
 				dt = entry.ref_doctype
-			consumer_doctypes.append({"doctype": dt, "condition": entry.condition})
+			consumer_doctypes.append(
+				{"doctype": dt, "condition": entry.condition, "sync_on": entry.get("sync_on")}
+			)
 
 		user_key = frappe.db.get_value("User", self.user, "api_key")
 		user_secret = get_decrypted_password("User", self.user, "api_secret")
@@ -180,6 +182,7 @@ class EventProducer(Document):
 							"status": get_approval_status(config, ref_doctype),
 							"unsubscribed": entry.unsubscribe,
 							"condition": entry.condition,
+							"sync_on": entry.get("sync_on"),
 						}
 					)
 				event_consumer.user = self.user

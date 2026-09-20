@@ -35,7 +35,9 @@ def notify_consumers(doc, event):
 
 	consumers = check_doctype_has_consumers(doc.doctype)
 	if consumers:
-		if event == "after_insert":
+		if stream_after_submit(doc.doctype):
+			notify_consumers_after_submit(doc, event)
+		elif event == "after_insert":
 			doc.flags.event_update_log = make_event_update_log(doc, update_type="Create")
 		elif event == "on_trash":
 			make_event_update_log(doc, update_type="Delete")
@@ -48,18 +50,85 @@ def notify_consumers(doc, event):
 					doc.diff = diff
 					make_event_update_log(doc, update_type="Update")
 
+
+def notify_consumers_after_submit(doc, event):
+	"""notify_consumers for a doctype subscribed with "Sync On: After Submit":
+	nothing is streamed while the document is a draft, the submit itself is
+	streamed as a Create carrying the whole submitted document - so the
+	consumer inserts it already submitted, instead of getting an Update diff
+	for a document it never received, which set_update() silently drops - and
+	only changes made after that (update after submit, cancel, delete) are
+	streamed as diffs the way any other doctype is."""
+	if event == "after_insert":
+		# a draft has nothing to stream, but a document inserted already
+		# submitted (applied by a consumer, or created by a script) never had
+		# a draft stage to skip
+		if doc.docstatus == 1:
+			doc.flags.event_update_log = make_event_update_log(doc, update_type="Create")
+		return
+
+	if event == "on_trash":
+		# a draft was never streamed, so there is nothing for a consumer to delete
+		if doc.docstatus != 0:
+			make_event_update_log(doc, update_type="Delete")
+		return
+
+	# on_update / on_cancel
+	if doc.flags.event_update_log:  # already inserted by this same save
+		return
+
+	if doc.docstatus == 0:
+		# still a draft: consumers see nothing until it is submitted
+		return
+
+	before = doc.get_doc_before_save()
+	if doc.docstatus == 1 and (not before or before.docstatus == 0):
+		# the submit itself: stream the whole document, not a diff
+		make_event_update_log(doc, update_type="Create")
+		return
+
+	if before:
+		# update after submit, or cancel: diff against what the consumer has
+		diff = get_update(before, doc)
+		if diff:
+			doc.diff = diff
+			make_event_update_log(doc, update_type="Update")
+
 ENABLED_DOCTYPES_CACHE_KEY = "event_streaming_enabled_doctypes"
 
-def check_doctype_has_consumers(doctype: str) -> bool:
-	"""Check if doctype has event consumers for event streaming"""
+def get_consumer_config(doctype: str) -> list:
+	"""Approved, still subscribed Event Consumer Document Type rows for this
+	doctype. Cached; saving an Event Consumer clears the key (clear_cache)."""
 	def fetch_from_db():
 		return frappe.get_all(
 			"Event Consumer Document Type",
 			filters={"ref_doctype": doctype, "status": "Approved", "unsubscribed": 0},
+			fields=["name", "sync_on"],
 			ignore_ddl=True,
 		)
 
-	return bool(frappe.cache().hget(ENABLED_DOCTYPES_CACHE_KEY, doctype, fetch_from_db))
+	return frappe.cache().hget(ENABLED_DOCTYPES_CACHE_KEY, doctype, fetch_from_db) or []
+
+
+def check_doctype_has_consumers(doctype: str) -> bool:
+	"""Check if doctype has event consumers for event streaming"""
+	return bool(get_consumer_config(doctype))
+
+
+def stream_after_submit(doctype: str) -> bool:
+	"""Whether this doctype is streamed only once submitted, i.e. every
+	consumer subscribed to it asked for "Sync On: After Submit".
+
+	One Event Update Log serves all consumers of a doctype, so holding the
+	draft back is only safe when no consumer is left on "After Insert" - such a
+	consumer would otherwise never receive the document at all. A doctype that
+	is not submittable is always streamed after insert, since it would
+	otherwise be held back forever."""
+	config = get_consumer_config(doctype)
+	if not config or not all(entry.get("sync_on") == "After Submit" for entry in config):
+		return False
+
+	return bool(frappe.get_meta(doctype).is_submittable)
 
 
 def get_update(old, new, for_child=False):

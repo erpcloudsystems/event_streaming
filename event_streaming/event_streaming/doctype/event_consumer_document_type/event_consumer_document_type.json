@@ -7,12 +7,13 @@
  "field_order": [
   "ref_doctype",
   "status",
+  "sync_on",
   "unsubscribed",
   "condition"
  ],
  "fields": [
   {
-   "columns": 4,
+   "columns": 3,
    "fieldname": "ref_doctype",
    "fieldtype": "Link",
    "in_list_view": 1,
@@ -22,7 +23,7 @@
    "reqd": 1
   },
   {
-   "columns": 4,
+   "columns": 3,
    "default": "Pending",
    "fieldname": "status",
    "fieldtype": "Select",
@@ -43,6 +44,17 @@
    "fieldname": "condition",
    "fieldtype": "Code",
    "label": "Condition",
+   "read_only": 1
+  },
+  {
+   "columns": 2,
+   "default": "After Insert",
+   "description": "When the producer starts streaming this document. \"After Submit\" holds back the draft and streams the document as it is submitted, so it is created on this site already submitted.",
+   "fieldname": "sync_on",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Sync On",
+   "options": "After Insert\nAfter Submit",
    "read_only": 1
   }
  ],
