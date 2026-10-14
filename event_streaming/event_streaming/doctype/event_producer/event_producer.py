@@ -496,7 +496,11 @@ def sync_dependencies(document, producer_site):
 		# mark synced for nested dependency
 		if dependency != document:
 			dependencies[dependency] = False
-			dependency.insert()
+			# the same dependency can be queued more than once (e.g. several child rows
+			# linking to the same document), so skip it if it already exists
+			if not check_dependency_fulfilled(dependency.doctype, dependency.name):
+				dependency.insert(set_name=dependency.name)
+				frappe.db.commit()
 
 		# no more dependencies left to be synced, the main doc is ready to be synced
 		# end the dependency loop
