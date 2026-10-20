@@ -755,3 +755,63 @@ def resync(update):
 		# resync of an unmapped update failed, passing a string to get_doc()
 		update.data = json.loads(update.data)
 	return sync(update, producer_site, event_producer, in_retry=True)
+
+
+BULK_RESYNC_JOB_ID = "event_streaming::bulk_resync"
+
+
+@frappe.whitelist()
+def bulk_resync(names):
+	"""Resync the Failed ones among the given Event Sync Logs (list view
+	action). Runs in a background job: a large selection would outlast the
+	request timeout (and Cloudflare's 120s in front of it)."""
+	from frappe.utils.background_jobs import is_job_enqueued
+
+	frappe.has_permission("Event Sync Log", "write", throw=True)
+	names = frappe.parse_json(names) if isinstance(names, str) else names
+
+	if is_job_enqueued(BULK_RESYNC_JOB_ID):
+		frappe.throw(_("A bulk resync is already running. Try again once it has finished."))
+
+	failed = frappe.get_all("Event Sync Log", filters={"name": ("in", names), "status": "Failed"}, pluck="name")
+	if failed:
+		frappe.enqueue(
+			"event_streaming.event_streaming.doctype.event_producer.event_producer.bulk_resync_job",
+			queue="long",
+			timeout=max(1500, 15 * len(failed)),
+			job_id=BULK_RESYNC_JOB_ID,
+			names=failed,
+			user=frappe.session.user,
+		)
+	return len(failed)
+
+
+def bulk_resync_job(names, user):
+	# oldest first, as they were synced: a document's dependencies and earlier
+	# updates come before the updates that need them
+	logs = frappe.get_all(
+		"Event Sync Log",
+		filters={"name": ("in", names), "status": "Failed"},
+		pluck="name",
+		order_by="creation asc",
+	)
+	counts = {"Synced": 0, "Failed": 0}
+	for name in logs:
+		log = frappe.get_doc("Event Sync Log", name)
+		try:
+			status = resync(frappe.as_json(log.as_dict()))
+		except Exception:
+			# e.g. the producer could not be reached; sync() itself never raises here
+			reset_transaction()
+			frappe.log_error(
+				title=_("Event Streaming: resync of {0} {1} failed").format(log.ref_doctype, log.docname)
+			)
+			status = "Failed"
+
+		if status == "Synced":
+			log.db_set("status", "Synced")
+		counts[status] += 1
+		frappe.db.commit()
+
+	# shown and the list refreshed by event_sync_log_list.js
+	frappe.publish_realtime("event_streaming_bulk_resync_done", counts, user=user)
