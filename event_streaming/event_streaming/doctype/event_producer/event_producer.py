@@ -340,6 +340,14 @@ def sync(update, producer_site, event_producer, in_retry=False):
 		if in_retry:
 			if frappe.flags.in_test:
 				print(frappe.get_traceback())
+			# the Resync button only gets "Failed" back: keep the reason, and
+			# don't let the request commit the update's partial writes
+			error = frappe.get_traceback()
+			reset_transaction()
+			frappe.log_error(
+				title=_("Event Streaming: resync of {0} {1} failed").format(update.ref_doctype, update.docname),
+				message=error,
+			)
 			return "Failed"
 		error = frappe.get_traceback()
 		reset_transaction()
@@ -704,5 +712,9 @@ def resync(update):
 	event_producer = frappe.get_doc("Event Producer", update.event_producer)
 	if update.mapping:
 		update = get_mapped_update(update, producer_site)
+		update.data = json.loads(update.data)
+	elif isinstance(update.data, str):
+		# the Event Sync Log keeps the data as JSON text; without this every
+		# resync of an unmapped update failed, passing a string to get_doc()
 		update.data = json.loads(update.data)
 	return sync(update, producer_site, event_producer, in_retry=True)
