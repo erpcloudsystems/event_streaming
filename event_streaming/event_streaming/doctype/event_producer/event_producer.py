@@ -11,9 +11,23 @@ from frappe import _
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
 from frappe.frappeclient import FrappeClient
 from frappe.model.document import Document
+from frappe.utils import cint, get_datetime
 from frappe.utils.background_jobs import get_jobs
 from frappe.utils.data import get_link_to_form, get_url
 from frappe.utils.password import get_decrypted_password
+
+PULL_METHOD = "event_streaming.event_streaming.doctype.event_producer.event_producer.pull_from_node"
+# updates fetched per request - small enough for the producer to answer well
+# within a proxy's timeout (Cloudflare: 120s); override with
+# "event_streaming_pull_batch_size" in site_config.json
+PULL_BATCH_SIZE = 200
+# batches synced per job before the rest is handed to a fresh job, so a large
+# backlog never runs into the job timeout halfway through
+PULL_BATCHES_PER_JOB = 5
+
+
+class EventStreamingRequestError(Exception):
+	pass
 
 
 class EventProducer(Document):
@@ -231,27 +245,56 @@ def pull_producer_data():
 	return None
 
 
+def pull_from_all_producers():
+	"""Hourly safety net (see hooks.py): pulls are otherwise only triggered by
+	the producer's notification, so one that is lost (this site was down, the
+	request was dropped) would leave updates waiting until the next change is
+	made on the producer."""
+	for event_producer in frappe.get_all("Event Producer", pluck="name"):
+		new_event_notification(event_producer)
+
+
 @frappe.whitelist()
 def pull_from_node(event_producer):
-	"""pull all updates after the last update timestamp from event producer site"""
+	"""pull updates after the last update timestamp from event producer site,
+	a batch at a time (see PULL_BATCH_SIZE)"""
 	event_producer = frappe.get_doc("Event Producer", event_producer)
 	producer_site = get_producer_site(event_producer.producer_url)
-	last_update = event_producer.get_last_update()
 
 	(doctypes, mapping_config, naming_config) = get_config(event_producer.producer_doctypes)
+	batch_size = cint(frappe.conf.get("event_streaming_pull_batch_size")) or PULL_BATCH_SIZE
 
-	updates = get_updates(producer_site, last_update, doctypes)
+	for _batch in range(PULL_BATCHES_PER_JOB):
+		last_update = event_producer.get_last_update()
+		try:
+			updates, next_last_update, has_more = get_updates(producer_site, last_update, doctypes, batch_size)
+		except Exception:
+			# a failed job only reaches worker.error.log; record it where it is seen
+			frappe.db.rollback()
+			frappe.log_error(title=_("Event Streaming: could not fetch updates from {0}").format(event_producer.name))
+			frappe.db.commit()
+			raise
 
-	for update in updates:
-		update.use_same_name = naming_config.get(update.ref_doctype)
-		mapping = mapping_config.get(update.ref_doctype)
-		if mapping:
-			update.mapping = mapping
-			update = get_mapped_update(update, producer_site)
-		if not update.update_type == "Delete":
-			update.data = json.loads(update.data)
+		for update in updates:
+			update.use_same_name = naming_config.get(update.ref_doctype)
+			mapping = mapping_config.get(update.ref_doctype)
+			if mapping:
+				update.mapping = mapping
+				update = get_mapped_update(update, producer_site)
+			if not update.update_type == "Delete":
+				update.data = json.loads(update.data)
 
-		sync(update, producer_site, event_producer)
+			sync(update, producer_site, event_producer)
+
+		if next_last_update:
+			# also moves past logs in this batch the consumer has no access to
+			advance_last_update(event_producer, next_last_update)
+			frappe.db.commit()
+
+		if not has_more:
+			return
+
+	frappe.enqueue(PULL_METHOD, queue="long", event_producer=event_producer.name)
 
 
 def get_config(event_config):
@@ -275,13 +318,20 @@ def get_config(event_config):
 
 def sync(update, producer_site, event_producer, in_retry=False):
 	"""Sync the individual update"""
+	# relaxes ERPNext's closed/on-hold order checks while applying it - see there
+	import event_streaming.erpnext_overrides  # noqa: F401
+
 	try:
-		if update.update_type == "Create":
-			set_insert(update, producer_site, event_producer.name)
-		if update.update_type == "Update":
-			set_update(update, producer_site)
-		if update.update_type == "Delete":
-			set_delete(update)
+		frappe.flags.in_event_streaming_sync = True
+		try:
+			if update.update_type == "Create":
+				set_insert(update, producer_site, event_producer.name)
+			if update.update_type == "Update":
+				set_update(update, producer_site)
+			if update.update_type == "Delete":
+				set_delete(update)
+		finally:
+			frappe.flags.in_event_streaming_sync = False
 		if in_retry:
 			return "Synced"
 		log_event_sync(update, event_producer.name, "Synced")
@@ -291,10 +341,51 @@ def sync(update, producer_site, event_producer, in_retry=False):
 			if frappe.flags.in_test:
 				print(frappe.get_traceback())
 			return "Failed"
-		log_event_sync(update, event_producer.name, "Failed", frappe.get_traceback())
+		error = frappe.get_traceback()
+		reset_transaction()
+		try:
+			log_event_sync(update, event_producer.name, "Failed", error)
+		except Exception:
+			# if even the Failed log can't be written, the error must not
+			# escape: it would fail the whole pull before last_update moves,
+			# and every later pull would stop on this same update again
+			reset_transaction()
+			frappe.log_error(
+				title=_("Event Streaming: could not log failed sync of {0} {1}").format(
+					update.ref_doctype, update.docname
+				),
+				message=f"update: {update.update_type} {update.ref_doctype} {update.docname} "
+				f"(Event Update Log {update.name} on {event_producer.name})\n\n"
+				f"sync error:\n{error}\n\nlogging error:\n{frappe.get_traceback()}",
+			)
 
-	event_producer.set_last_update(update.creation)
+	advance_last_update(event_producer, update.creation)
 	frappe.db.commit()
+
+
+def reset_transaction():
+	"""Roll back a failed update's partial writes. When the error broke the DB
+	connection itself (e.g. "Packet sequence number wrong"), rolling back
+	fails as well, so reconnect instead."""
+	try:
+		frappe.db.rollback()
+	except Exception:
+		try:
+			frappe.db.close()
+		except Exception:
+			pass
+		frappe.db.connect()
+
+
+def advance_last_update(event_producer, last_update):
+	"""Move the producer's last_update forward, never back: updates are not
+	strictly in creation order (a document's old unread logs are sent right
+	before its newer one), and a pull stopped halfway must not resume from an
+	older point."""
+	current = event_producer.get_last_update()
+	if current and get_datetime(last_update) <= get_datetime(current):
+		return
+	event_producer.set_last_update(last_update)
 
 
 def set_insert(update, producer_site, event_producer):
@@ -400,17 +491,54 @@ def set_delete(update):
 		local_doc.delete()
 
 
-def get_updates(producer_site, last_update, doctypes):
-	"""Get all updates generated after the last update timestamp"""
-	docs = producer_site.post_request(
-		{
-			"cmd": "event_streaming.event_streaming.doctype.event_update_log.event_update_log.get_update_logs_for_consumer",
-			"event_consumer": get_url(),
-			"doctypes": frappe.as_json(doctypes),
-			"last_update": last_update,
-		}
+def get_updates(producer_site, last_update, doctypes, limit=None):
+	"""Get the updates generated after the last update timestamp, at most
+	`limit` of them (plus any sharing the newest one's timestamp).
+
+	Returns (updates, next_last_update, has_more). A producer that predates
+	paging ignores `limit` and returns every update at once: that comes back
+	as (updates, None, False).
+
+	FrappeClient.post_request() returns None for any JSON reply without a
+	"message" - which is what an error from a proxy in front of the producer
+	(Cloudflare 524 after 120s) or an error raised by the producer itself
+	without a traceback looks like - so it used to pass for "no updates" and
+	the pull silently did nothing. Anything but a 200 with a message raises."""
+	data = {
+		"cmd": "event_streaming.event_streaming.doctype.event_update_log.event_update_log.get_update_logs_for_consumer",
+		"event_consumer": get_url(),
+		"doctypes": frappe.as_json(doctypes),
+		"last_update": last_update,
+	}
+	if limit:
+		data["limit"] = limit
+
+	response = producer_site.session.post(
+		producer_site.url,
+		data=producer_site.preprocess(data),
+		verify=producer_site.verify,
+		headers=producer_site.headers,
 	)
-	return [frappe._dict(d) for d in (docs or [])]
+	if response.status_code != 200:
+		raise EventStreamingRequestError(
+			f"{producer_site.url} returned HTTP {response.status_code} for "
+			f"get_update_logs_for_consumer: {response.text[:1000]}"
+		)
+
+	docs = producer_site.post_process(response)
+	if docs is None:
+		raise EventStreamingRequestError(
+			f"{producer_site.url} returned no message for get_update_logs_for_consumer: "
+			f"{response.text[:1000]}"
+		)
+
+	if isinstance(docs, dict):
+		return (
+			[frappe._dict(d) for d in docs.get("logs") or []],
+			docs.get("next_last_update"),
+			bool(docs.get("has_more")),
+		)
+	return [frappe._dict(d) for d in docs], None, False
 
 
 def get_local_doc(update):
@@ -562,10 +690,10 @@ def get_mapped_update(update, producer_site):
 @frappe.whitelist()
 def new_event_notification(producer_url):
 	"""Pull data from producer when notified"""
-	enqueued_method = "event_streaming.event_streaming.doctype.event_producer.event_producer.pull_from_node"
 	jobs = get_jobs()
-	if not jobs or enqueued_method not in jobs[frappe.local.site]:
-		frappe.enqueue(enqueued_method, queue="default", **{"event_producer": producer_url})
+	if not jobs or PULL_METHOD not in jobs[frappe.local.site]:
+		# long queue: a backlog takes several batches (see pull_from_node)
+		frappe.enqueue(PULL_METHOD, queue="long", **{"event_producer": producer_url})
 
 
 @frappe.whitelist()

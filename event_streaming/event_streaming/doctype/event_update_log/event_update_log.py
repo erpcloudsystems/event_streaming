@@ -4,6 +4,7 @@
 import frappe
 from frappe.model import no_value_fields, table_fields
 from frappe.model.document import Document
+from frappe.utils import cint
 from frappe.utils.background_jobs import get_jobs
 
 
@@ -289,9 +290,10 @@ def mark_consumer_read(update_log_name, consumer_name):
 	).insert(ignore_permissions=True)
 
 
-def get_unread_update_logs(consumer_name, dt, dn):
+def get_unread_update_logs(consumer_name, dt, dn, upto=None):
 	"""
 	Get old logs unread by the consumer on a particular document
+	(only up to the `upto` creation timestamp, if given)
 	"""
 	already_consumed = [
 		x[0]
@@ -300,28 +302,32 @@ def get_unread_update_logs(consumer_name, dt, dn):
 		SELECT
 			update_log.name
 		FROM `tabEvent Update Log` update_log
-		JOIN `tabEvent Update Log Consumer` consumer ON consumer.parent = %(log_name)s
+		JOIN `tabEvent Update Log Consumer` consumer ON consumer.parent = update_log.name
 		WHERE
 			consumer.consumer = %(consumer)s
 			AND update_log.ref_doctype = %(dt)s
 			AND update_log.docname = %(dn)s
 	""",
-			{
-				"consumer": consumer_name,
-				"dt": dt,
-				"dn": dn,
-				"log_name": "update_log.name"
-				if frappe.conf.db_type == "mariadb"
-				else "CAST(update_log.name AS VARCHAR)",
-			},
+			# the join column used to be passed in as a query parameter, i.e. as
+			# the string 'update_log.name', so nothing ever matched and every
+			# log of the document was re-sent as unread
+			{"consumer": consumer_name, "dt": dt, "dn": dn},
 			as_dict=0,
 		)
 	]
 
+	filters = [
+		["ref_doctype", "=", dt],
+		["docname", "=", dn],
+		["name", "not in", already_consumed],
+	]
+	if upto:
+		filters.append(["creation", "<=", upto])
+
 	logs = frappe.get_all(
 		"Event Update Log",
 		fields=["update_type", "ref_doctype", "docname", "data", "name", "creation"],
-		filters={"ref_doctype": dt, "docname": dn, "name": ["not in", already_consumed]},
+		filters=filters,
 		order_by="creation",
 	)
 
@@ -329,10 +335,21 @@ def get_unread_update_logs(consumer_name, dt, dn):
 
 
 @frappe.whitelist()
-def get_update_logs_for_consumer(event_consumer, doctypes, last_update):
+def get_update_logs_for_consumer(event_consumer, doctypes, last_update, limit=None):
 	"""
 	Fetches all the UpdateLogs for the consumer
 	It will inject old un-consumed Update Logs if a doc was just found to be accessible to the Consumer
+
+	With `limit`, only the oldest `limit` Update Logs after last_update are
+	looked at, and a dict is returned instead of a list:
+	{"logs": [...], "next_last_update": <creation of the newest log looked at>,
+	"has_more": <whether newer logs are left>}. A consumer pages through a
+	backlog this way in requests short enough to finish before a proxy in
+	front of the site gives up on them (Cloudflare cuts at 120s, and its
+	error reply reads as "no updates" to FrappeClient). next_last_update is
+	returned even when none of the logs looked at is accessible to the
+	consumer, so it can move past them. Without `limit`, the old unbounded
+	list is returned, for consumers that have not been updated yet.
 	"""
 
 	if isinstance(doctypes, str):
@@ -340,10 +357,30 @@ def get_update_logs_for_consumer(event_consumer, doctypes, last_update):
 
 	from event_streaming.event_streaming.doctype.event_consumer.event_consumer import has_consumer_access
 
+	limit = cint(limit)
+	filters = [["ref_doctype", "in", doctypes], ["creation", ">", last_update]]
+
+	upper_bound = None
+	if limit:
+		batch = frappe.get_list(
+			doctype="Event Update Log",
+			filters=filters,
+			fields=["creation"],
+			order_by="creation asc",
+			limit_page_length=limit,
+		)
+		if not batch:
+			return {"logs": [], "next_last_update": None, "has_more": False}
+
+		# logs sharing the boundary timestamp are all taken below, so none of
+		# them is skipped when the consumer moves past it
+		upper_bound = batch[-1].creation
+		filters = [*filters, ["creation", "<=", upper_bound]]
+
 	consumer = frappe.get_doc("Event Consumer", event_consumer)
 	docs = frappe.get_list(
 		doctype="Event Update Log",
-		filters={"ref_doctype": ("in", doctypes), "creation": (">", last_update)},
+		filters=filters,
 		fields=["update_type", "ref_doctype", "docname", "data", "name", "creation"],
 		order_by="creation desc",
 	)
@@ -361,7 +398,9 @@ def get_update_logs_for_consumer(event_consumer, doctypes, last_update):
 		if not is_consumer_uptodate(d, consumer):
 			to_update_history.append((d.ref_doctype, d.docname))
 			# get_unread_update_logs will have the current log
-			old_logs = get_unread_update_logs(consumer.name, d.ref_doctype, d.docname)
+			# (not past this batch: a newer log returned now would move the
+			# consumer's last_update beyond logs it has not been sent yet)
+			old_logs = get_unread_update_logs(consumer.name, d.ref_doctype, d.docname, upto=upper_bound)
 			if old_logs:
 				old_logs.reverse()
 				result.extend(old_logs)
@@ -372,4 +411,15 @@ def get_update_logs_for_consumer(event_consumer, doctypes, last_update):
 		mark_consumer_read(update_log_name=d.name, consumer_name=consumer.name)
 
 	result.reverse()
-	return result
+	if not limit:
+		return result
+
+	has_more = bool(
+		frappe.get_list(
+			doctype="Event Update Log",
+			filters=[["ref_doctype", "in", doctypes], ["creation", ">", upper_bound]],
+			fields=["name"],
+			limit_page_length=1,
+		)
+	)
+	return {"logs": result, "next_last_update": upper_bound, "has_more": has_more}

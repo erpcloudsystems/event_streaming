@@ -114,6 +114,12 @@ doc_events = {
 # Scheduled Tasks
 # ---------------
 
+scheduler_events = {
+	"hourly_long": [
+		"event_streaming.event_streaming.doctype.event_producer.event_producer.pull_from_all_producers"
+	],
+}
+
 # scheduler_events = {
 #	"all": [
 #		"event_streaming.tasks.all"
