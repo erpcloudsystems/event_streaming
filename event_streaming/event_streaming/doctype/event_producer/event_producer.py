@@ -411,16 +411,48 @@ def set_insert(update, producer_site, event_producer):
 	else:
 		sync_dependencies(doc, producer_site)
 
-	doc.flags.via_event_streaming_sync = True
-
 	if update.use_same_name:
-		doc.insert(set_name=update.docname, set_child_names=False)
+		insert_synced_doc(doc, set_name=update.docname, set_child_names=False)
 	else:
 		# if event consumer is not saving documents with the same name as the producer
 		# store the remote docname in a custom field for future updates
 		doc.remote_docname = update.docname
 		doc.remote_site_name = event_producer
-		doc.insert(set_child_names=False)
+		insert_synced_doc(doc, set_child_names=False)
+
+
+def insert_synced_doc(doc, **insert_kwargs):
+	"""Insert a document copied from the producer - the synced document itself
+	or a dependency fetched for it - the way it was made there.
+
+	- A submitted document is saved as a draft first and then submitted.
+	  Inserting it with docstatus 1 in one go skips the state ERPNext
+	  expects in between: a Serial and Batch Bundle made from the rows'
+	  batch_no/serial_no at submit could not find its voucher ("Could not
+	  find Voucher No ...", "... not linked to Delivery Note None").
+	- A Serial and Batch Bundle is inserted as a draft only: ERPNext submits
+	  it itself when its voucher is submitted, and refuses a submitted one
+	  whose voucher doesn't exist yet.
+	- Edit Posting Date and Time is set, or ERPNext's validate_posting_time()
+	  replaces the producer's posting date/time with the moment of the sync.
+	- It is flagged as written by event_streaming, so this site doesn't
+	  stream it back to the producer.
+	"""
+	if doc.flags.submit_after_sync_insert is None:
+		doc.flags.submit_after_sync_insert = (
+			doc.docstatus == 1 and doc.meta.is_submittable and doc.doctype != "Serial and Batch Bundle"
+		)
+	if doc.docstatus == 1 and doc.meta.is_submittable:
+		doc.docstatus = 0
+
+	if doc.meta.has_field("set_posting_time"):
+		doc.set_posting_time = 1
+	doc.flags.via_event_streaming_sync = True
+
+	doc.insert(**insert_kwargs)
+	if doc.flags.submit_after_sync_insert:
+		doc.submit()
+	return doc
 
 
 def set_update(update, producer_site):
@@ -446,6 +478,11 @@ def set_update(update, producer_site):
 		else:
 			sync_dependencies(local_doc, producer_site)
 
+		if local_doc.docstatus == 0 and local_doc.meta.has_field("set_posting_time"):
+			# a draft is validated again on save, which would move its posting
+			# date/time to now (see insert_synced_doc); a submitted one can't
+			# change this field and isn't re-validated anyway
+			local_doc.set_posting_time = 1
 		local_doc.flags.via_event_streaming_sync = True
 		local_doc.save()
 		local_doc.db_update_all()
@@ -600,7 +637,7 @@ def sync_dependencies(document, producer_site):
 			linked_doctype = doc.get(df.options)
 			if docname and not check_dependency_fulfilled(linked_doctype, docname):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
-				frappe.get_doc(master_doc).insert(set_name=docname)
+				insert_synced_doc(frappe.get_doc(master_doc), set_name=docname)
 
 	def set_dependencies(doc, link_fields, producer_site):
 		for df in link_fields:
@@ -610,7 +647,7 @@ def sync_dependencies(document, producer_site):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
 				try:
 					master_doc = frappe.get_doc(master_doc)
-					master_doc.insert(set_name=docname)
+					insert_synced_doc(master_doc, set_name=docname)
 					frappe.db.commit()
 
 				# for dependency inside a dependency
@@ -635,7 +672,7 @@ def sync_dependencies(document, producer_site):
 			# the same dependency can be queued more than once (e.g. several child rows
 			# linking to the same document), so skip it if it already exists
 			if not check_dependency_fulfilled(dependency.doctype, dependency.name):
-				dependency.insert(set_name=dependency.name)
+				insert_synced_doc(dependency, set_name=dependency.name)
 				frappe.db.commit()
 
 		# no more dependencies left to be synced, the main doc is ready to be synced
@@ -650,7 +687,7 @@ def sync_mapped_dependencies(dependencies, producer_site):
 		doc = frappe._dict(json.loads(entry[1]))
 		docname = frappe.db.exists(doc.doctype, doc.name)
 		if not docname:
-			doc = frappe.get_doc(doc).insert(set_child_names=False)
+			doc = insert_synced_doc(frappe.get_doc(doc), set_child_names=False)
 			dependencies_created[entry[0]] = doc.name
 		else:
 			dependencies_created[entry[0]] = docname
